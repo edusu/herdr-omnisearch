@@ -49,7 +49,7 @@ herdr-core sees.
 dest=~/.config/herdr-app/mods/omnisearch
 [ -e "$dest" ] && echo "already installed" || {
   mkdir "$dest"
-  cp omnisearch/mods/omnisearch/main.js omnisearch/mods/omnisearch/mod.json "$dest"/
+  cp omnisearch/mods/omnisearch/* "$dest"/
 }
 ```
 
@@ -133,7 +133,7 @@ After new commits are merged into the checked-out branch:
 
 ```bash
 uv tool install --force "git+file://$PWD@$(git rev-parse HEAD)"
-cp omnisearch/mods/omnisearch/main.js omnisearch/mods/omnisearch/mod.json \
+cp omnisearch/mods/omnisearch/* \
   ~/.config/herdr-app/mods/omnisearch/
 ```
 

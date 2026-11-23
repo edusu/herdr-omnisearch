@@ -6,23 +6,25 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { exec, knownAgents, machines, panes, agents, spaces, focused, run, notify, theme, props, closeOverlay, settings } from "herdr";
+import { exec, knownAgents, machines, panes, agents, spaces, focused, run, notify, theme, props, openOverlay, closeOverlay, settings, readTextFile, appHome } from "herdr";
+import { TEXT, DEFAULTS, px, grow, fit, setSizes } from "./scale.js";
+import { PLACEMENTS, placementOf } from "./placement.js";
 
 const CLI = "herdr-omnisearch";
 const INSTALL = "uv tool install git+https://github.com/dmnkf/herdr-omnisearch";
 const LIMIT = 40;
 const DEBOUNCE_MS = 90;
 const LAUNCHERS_WAIT_MS = 5000;
-const ROW_H = 36;
-const ROW_SNIPPET_H = 54;
-const HEADER_H = 30;
-const CHROME_H = 92;
+// The popup mod.json describes, for a copy that moves back into one.
+const POPUP = { kind: "popup", at: "top", offset: 28, width: 0.92, height: 0.88 };
+const PANE_REFRESH_MS = 10_000;
+// Narrower than this, as in a side pane, the list takes the whole width.
+const PREVIEW_MIN_W = 720;
 const SUGGESTIONS = 4;
 const RECENT = "recent";
 const BEST = "best";
 // A selection names its section and its row: one agent can be in Recent and in its machine's section.
 const SEL = "\u0000";
-const SCREEN_LINE_H = 16;
 const SCREEN_REFRESH_MS = 2000;
 const CONVERSATION_REFRESH_MS = 3000;
 const MODES = [["live", "Live"], ["sessions", "Sessions"]];
@@ -336,8 +338,27 @@ function askPrograms() {
 
 export default class OmniSearch extends View {
   init(_props, cx) {
-    this.mode = "live";
-    this.query = "";
+    const p = props() ?? {};
+    // props() can be another copy's in a callback, and a mod pane gets no props().pane: it is the OmniSearch pane focused as it opens.
+    const opened = p.overlay ? null : panes().find((x) => x.mod === "omnisearch" && x.pane === (p.pane ?? focused()?.pane));
+    this.own = { overlay: p.overlay ?? null, pane: opened?.pane ?? null };
+    // The tab it was opened over: a copy moved out of a tab of its own goes back there.
+    this.tab = p.tab || focused()?.tab || null;
+    this.mode = p.mode === "sessions" ? "sessions" : "live";
+    this.query = typeof p.query === "string" ? p.query : "";
+    this.listShare = DEFAULTS.list_width;
+    this.showPreview = true;
+    cx.spawn(async (cx) => {
+      let own = {};
+      try {
+        own = JSON.parse((await readTextFile(`${appHome()}/mods/omnisearch/mod.json`)) ?? "{}").settings ?? {};
+      } catch {}
+      setSizes(own);
+      this.listShare = fit(own.list_width, "list_width");
+      this.showPreview = own.preview !== false;
+      if (own.mode === "sessions" && !p.mode && !this.query) this.setMode("sessions", cx);
+      cx.notify();
+    });
     this.selected = null;
     this.scroll = 0;
     this.typed = 0;
@@ -357,8 +378,7 @@ export default class OmniSearch extends View {
     this.screens = new Map();
     // Each selected session's messages, as the catalog has them, for the words searched.
     this.conversations = new Map();
-    // The popup is as tall as what it holds, up to its share of the window. Asking for more than any
-    // window has makes it take that whole share; the first measurement then fits the body to it.
+    // The body's size, once measured: the list's rows are placed by it.
     this.size = { width: 1400, height: 4000 };
     this.conversationScroll = ScrollHandle.new();
     this.conversationShown = null;
@@ -366,7 +386,12 @@ export default class OmniSearch extends View {
     this.screenRows = 30;
     this.previewing = null;
     cx.timer.every(250, (cx) => this.watchPreview(cx));
+    // A popup lists what was there when it opened; a pane or tab stays open, so it reads again.
+    cx.timer.every(PANE_REFRESH_MS, (cx) => {
+      if (!this.own.overlay && !this.closed) this.refresh(cx);
+    });
     this.input = InputState.new({ placeholder: "Search agents by what they show or said" });
+    if (this.query) this.input.set_value(this.query);
     this.input.on("change", (_e, cx) => {
       this.query = this.input.value();
       this.selected = null;
@@ -413,10 +438,46 @@ export default class OmniSearch extends View {
     return launcher && item.argv[0] === item.agent ? [...launcher, ...item.argv.slice(1)] : item.argv;
   }
 
-  // The app calls this when the popup closes, and so does Esc.
+  // The app calls this when the popup, pane or tab goes.
   close() {
     this.closed = true;
-    closeOverlay(props().overlay);
+    if (this.own.overlay) closeOverlay(this.own.overlay);
+  }
+
+  // After Enter on a row, and on Esc: a popup goes away, a pane or tab stays.
+  leave() {
+    if (this.own.overlay) this.close();
+  }
+
+  // This copy's pane, null in a popup. Known from init, else the only OmniSearch pane; `clicked`: the focused one,
+  // since a click on this copy focuses its pane.
+  ownPane(clicked = false) {
+    if (this.own.overlay) return null;
+    const mods = panes().filter((x) => x.mod === "omnisearch");
+    const mine = mods.find((x) => x.pane === this.own.pane) ?? (clicked ? mods.find((x) => x.focused) : null) ?? (mods.length === 1 ? mods[0] : null);
+    if (mine) this.own.pane = mine.pane;
+    return mine ?? null;
+  }
+
+  // Moves OmniSearch to another placement: a copy opens there with the same words, then this one closes.
+  moveTo(where, clicked = false) {
+    const all = panes(), mine = this.ownPane(clicked);
+    const here = placementOf({ overlay: this.own.overlay, pane: mine?.pane }, all, this.tab);
+    // Without its own pane it couldn't close itself: two would stay open.
+    if (where === here || (here !== "popup" && !mine)) return;
+    const p = { query: this.query, mode: this.mode, tab: this.tab };
+    const origin = spaces().some((s) => s.tabs.some((x) => x.id === this.tab)) && this.tab !== mine?.tab ? this.tab : null;
+    if (where === "tab") run("tab.new", { name: "OmniSearch", mod: "omnisearch", props: p });
+    else {
+      // A pane and a popup belong over the tab it was opened over; when it's gone, over the one shown.
+      if (here === "tab" && origin) run("tab.select", { id: origin });
+      if (where === "pane") run("pane.split", { direction: "right", mod: "omnisearch", props: p });
+      else openOverlay({ mod: "omnisearch", ...POPUP, props: p });
+    }
+    // The whole tab only when this is all it holds and the copy went elsewhere: other panes there may be agents.
+    if (here === "popup") this.close();
+    else if (where !== "tab" && origin && all.filter((x) => x.tab === mine.tab).length === 1) run("tab.close", { id: mine.tab });
+    else run("pane.close", { pane: mine.pane });
   }
 
   targets() {
@@ -659,7 +720,7 @@ export default class OmniSearch extends View {
       return running ? this.goLive(item.machine, running, cx) : this.resume(item, cx);
     }
     if (item.kind === "space") {
-      this.close();
+      this.leave();
       return run("space.select", { id: qualify(item.machine, item.space) });
     }
     this.goLive(item.machine, item, cx);
@@ -668,7 +729,7 @@ export default class OmniSearch extends View {
   // A terminal in the app, or a pane of the herdr TUI: through the app terminal mirroring it, else in the TUI itself.
   goLive(machine, where, cx) {
     if (where.frontend !== "tui" || where.mirror) {
-      this.close();
+      this.leave();
       return where.frontend === "tui" ? this.focusTerminal(machine, where.mirror, null) : this.focusTerminal(machine, where.address, where.tab);
     }
     const args = ["focus-target", "--workspace-id", where.space ?? "", "--tab-id", where.tab ?? "", "--pane-id", where.address];
@@ -681,7 +742,7 @@ export default class OmniSearch extends View {
       } catch (e) {
         r = { code: 1, stderr: `${e?.message ?? e}` };
       }
-      this.close();
+      this.leave();
       const name = where.title || where.address;
       const tui = machine ? `the herdr TUI on ${machine}` : "the herdr TUI";
       if (r.code === 0) notify({ title: "OmniSearch", body: `${name} runs in ${tui}, not in the app. It is selected there now: switch to that TUI to see it, or press Shift+Enter on it here to move it into the app.` });
@@ -700,7 +761,7 @@ export default class OmniSearch extends View {
 
   resume(item, cx) {
     if (!item.argv) {
-      this.close();
+      this.leave();
       notify({ title: "OmniSearch", body: `No resume command for ${item.agent}`, level: "warning" });
       return;
     }
@@ -719,8 +780,11 @@ export default class OmniSearch extends View {
         found = { rows: [], error: `${e?.message ?? e}` };
       }
       const running = found.rows.find((r) => r.address);
+      // A pane or tab stays open after this, and Enter must work on its next row.
+      this.resuming = false;
+      cx.notify();
       if (running) return this.goLive(item.machine, running, cx);
-      this.close();
+      this.leave();
       // Only a check that answered may start it: one that failed can't tell a running session from an ended one.
       if (found.error) return notify({ title: "OmniSearch", body: `Didn't resume ${item.title || item.session_id}: ${found.error}`, level: "warning" });
       this.startResume(item, launchers, null);
@@ -795,7 +859,8 @@ export default class OmniSearch extends View {
           found = { rows: [], error: `${e?.message ?? e}` };
         }
         if (!found.error && !found.rows.some((r) => r.address)) {
-          this.close();
+          this.leave();
+          this.resuming = false;
           this.startResume(session, launchers, from.space);
           return notify({ title: "OmniSearch", body: `Moved ${name} from the TUI into the app.` });
         }
@@ -816,14 +881,14 @@ export default class OmniSearch extends View {
       return running ? div().size(6).mx(3).flex_none().rounded(3).bg(t.working) : null;
     }
     const status = this.statusOf(item);
-    if (status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900);
-    if (status === "blocked") return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
+    if (status === "working") return svg("mods/workspace-chrome/spinner.svg").size(px(12)).flex_none().text_color(t.working).spin(900);
+    if (status === "blocked") return div().flex_none().px(6).h(grow(18)).rounded(5).bg(t.blocked + "26").text_size(TEXT.label).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
     if (status === "done") return div().size(6).mx(3).flex_none().rounded(3).bg(t.done);
     return null;
   }
 
   rowHeight(item) {
-    return this.showSnippet(item) ? ROW_SNIPPET_H : ROW_H;
+    return this.showSnippet(item) ? grow(54) : grow(36);
   }
 
   // The row's second line says why it is listed: the text that matched, the folder it runs in, or
@@ -869,18 +934,18 @@ export default class OmniSearch extends View {
         h_flex()
           .gap(10)
           .items_center()
-          .child(item.kind === "space" ? svg("mods/workspace-chrome/layers.svg").size(16).flex_none().text_color(t.muted) : icon(this.program(item.agent), 16, t.foreground))
-          .child(this.name(t, naming(item), 13.5, this.words()))
+          .child(item.kind === "space" ? svg("mods/workspace-chrome/layers.svg").size(px(16)).flex_none().text_color(t.muted) : icon(this.program(item.agent), px(16), t.foreground))
+          .child(this.name(t, naming(item), TEXT.strong, this.words()))
           .when(Boolean(status), (el) => el.child(status))
-          .when(Boolean(suffix), (el) => el.child(div().flex_none().text_size(12).text_color(t.dim).child(suffix))),
+          .when(Boolean(suffix), (el) => el.child(div().flex_none().text_size(TEXT.body).text_color(t.dim).child(suffix))),
       )
       .when(snippet, (el) =>
         el.child(
           h_flex()
-            .pl(26)
+            .pl(px(16) + 10)
             .overflow_hidden()
             .whitespace_nowrap()
-            .text_size(12)
+            .text_size(TEXT.body)
             .when(Boolean(snippet?.quiet), (el) => el.italic())
             .children(runs(snippet?.text ?? "", snippet?.label ? [] : this.words()).map(([text, hit]) =>
               div().flex_none().text_color(hit ? t.accent : t.dim).when(hit, (d) => d.font_medium()).child(text))),
@@ -891,7 +956,7 @@ export default class OmniSearch extends View {
   preview(t, item) {
     if (!item) return v_flex().flex_1();
     const words = this.words();
-    const label = (text) => div().text_size(11).font_medium().text_color(t.dim).child(text);
+    const label = (text) => div().text_size(TEXT.small).font_medium().text_color(t.dim).child(text);
     let title;
     const meta = [];
     if (item.kind === "space") {
@@ -928,14 +993,14 @@ export default class OmniSearch extends View {
             h_flex()
               .gap(9)
               .items_center()
-              .child(item.kind === "space" ? svg("mods/workspace-chrome/layers.svg").size(18).flex_none().text_color(t.muted) : icon(this.program(item.agent), 18, t.foreground))
-              .child(this.name(t, naming(item), 14, words)),
+              .child(item.kind === "space" ? svg("mods/workspace-chrome/layers.svg").size(px(18)).flex_none().text_color(t.muted) : icon(this.program(item.agent), px(18), t.foreground))
+              .child(this.name(t, naming(item), TEXT.heading, words)),
           )
           .child(
             h_flex()
-              .pl(27)
+              .pl(px(18) + 9)
               .gap(6)
-              .text_size(12)
+              .text_size(TEXT.body)
               .child(div().min_w(0).truncate().text_color(t.dim).child(meta.filter((m) => m && m !== item.spaceName).join(" · "))),
           ),
       )
@@ -947,15 +1012,15 @@ export default class OmniSearch extends View {
             .child(
               h_flex()
                 .flex_wrap()
-                .max_h(154)
+                .max_h(grow(154))
                 .overflow_hidden()
                 .gap(4)
-                .text_size(12.5)
+                .text_size(TEXT.ui)
                 .children(excerptWords(excerpt, words).map(([word, hit], i) =>
                   div()
                     .id(`os-w-${i}`)
-                    .h(18)
-                    .line_height("18px")
+                    .h(grow(18))
+                    .line_height(`${grow(18)}px`)
                     .text_color(hit ? t.foreground : t.muted)
                     .when(hit, (d) => d.px(3).rounded(4).bg(t.accent + "40"))
                     .child(word))),
@@ -981,19 +1046,19 @@ export default class OmniSearch extends View {
                 .px(6)
                 .py(8)
                 .on_size_change((size, cx) => {
-                  const rows = Math.max(4, Math.floor((unzoomed(size).height - 16) / SCREEN_LINE_H));
+                  const rows = Math.max(4, Math.floor((unzoomed(size).height - 16) / grow(16)));
                   if (rows !== this.screenRows) {
                     this.screenRows = rows;
                     cx.notify();
                   }
                 })
                 .font_family("JetBrains Mono")
-                .text_size(11.5)
+                .text_size(TEXT.note)
                 .children(
                   lines.length
                     ? lines.map((line, i) => {
                         const hit = hits(plain(line), words);
-                        return h_flex().id(`os-l-${i}`).h(SCREEN_LINE_H).line_height(`${SCREEN_LINE_H}px`).flex_none().px(4).rounded(3).whitespace_nowrap().overflow_hidden()
+                        return h_flex().id(`os-l-${i}`).h(grow(16)).line_height(`${grow(16)}px`).flex_none().px(4).rounded(3).whitespace_nowrap().overflow_hidden()
                           .text_color(t.foreground).when(hit, (d) => d.bg(t.accent + "30"))
                           .children(ansiRuns(t, line).map(([text, st], j) =>
                             div().id(`os-r-${i}-${j}`).flex_none()
@@ -1011,7 +1076,7 @@ export default class OmniSearch extends View {
   }
 
   listH() {
-    return Math.max(200, this.size.height - CHROME_H);
+    return Math.max(200, this.size.height);
   }
 
   // The session's messages, newest at the bottom: yours on a tinted block, the agent's as rendered Markdown.
@@ -1027,7 +1092,7 @@ export default class OmniSearch extends View {
       .flex_1()
       .min_h(0)
       .gap(6)
-      .child(div().text_size(11).font_medium().text_color(t.dim).child("Conversation"))
+      .child(div().text_size(TEXT.small).font_medium().text_color(t.dim).child("Conversation"))
       .child(
         v_flex()
           .id("os-conv")
@@ -1050,11 +1115,11 @@ export default class OmniSearch extends View {
               .child(
                 h_flex()
                   .gap(6)
-                  .text_size(11)
+                  .text_size(TEXT.small)
                   .child(div().font_medium().text_color(you ? t.foreground : spaceColor(t, item.agent)).child(you ? "You" : agentName))
                   .when(Boolean(m.at), (d) => d.child(div().text_color(t.dim).child(ago(m.at)))),
               )
-              .child(div().text_size(12.5).text_color(t.foreground).child(TextView.markdown(`os-md-${item.key}-${i}`, m.text)));
+              .child(div().text_size(TEXT.ui).text_color(t.foreground).child(TextView.markdown(`os-md-${item.key}-${i}`, m.text)));
           })),
       );
   }
@@ -1110,12 +1175,13 @@ export default class OmniSearch extends View {
     const headed = sections.length > 1 || Boolean(sections[0]?.machine);
 
     // Every row and header gets a fixed top: GPUI rounds each height and a stack drifts.
+    const headerH = grow(30);
     const layout = [];
     let y = 4;
     for (const s of sections) {
       if (headed) {
-        layout.push({ header: s, top: y, h: HEADER_H });
-        y += HEADER_H;
+        layout.push({ header: s, top: y, h: headerH });
+        y += headerH;
       }
       for (const item of s.rows) {
         const h = this.rowHeight(item);
@@ -1124,13 +1190,15 @@ export default class OmniSearch extends View {
       }
     }
     const listH = this.listH();
+    const split = this.showPreview && this.size.width >= PREVIEW_MIN_W;
+    const listW = split ? Math.max(420, Math.round(this.size.width * this.listShare)) : this.size.width;
     const total = y + 4;
     this.maxScroll = Math.max(0, total - listH);
     const at = layout.find((l) => l.item && l.sid + SEL + l.item.key === selectedKey);
     // Only a new selection moves the list to it; the wheel moves it freely otherwise.
     if (at && selectedKey !== this.revealed) {
       this.revealed = selectedKey;
-      if (at.top - 4 < this.scroll) this.scroll = at.top - (layout[layout.indexOf(at) - 1]?.header ? HEADER_H + 4 : 4);
+      if (at.top - 4 < this.scroll) this.scroll = at.top - (layout[layout.indexOf(at) - 1]?.header ? headerH + 4 : 4);
       if (at.top + at.h + 4 > this.scroll + listH) this.scroll = at.top + at.h + 4 - listH;
     }
     this.scroll = Math.max(0, Math.min(this.scroll, this.maxScroll));
@@ -1145,32 +1213,26 @@ export default class OmniSearch extends View {
               .items_end()
               .pb(6)
               .gap(6)
-              .text_size(11.5)
+              .text_size(TEXT.note)
               .child(div().text_color(t.foreground).font_semibold().child(l.header.title))
               .child(div().text_color(t.dim).child(String(l.header.rows.length)))
           : this.row(t, l.item, l.sid + SEL + l.item.key === selectedKey, l.sid === RECENT || l.sid === BEST).id(`os-${l.sid}-${l.item.key}`);
         return el.absolute().left(0).right(0).top(l.top - this.scroll).h(l.h);
       });
 
-    const segment = ([mode, label]) =>
-      div()
-        .id(`os-mode-${mode}`)
-        .px(9)
-        .h(22)
-        .flex()
-        .items_center()
-        .rounded(6)
-        .text_size(12)
-        .cursor_pointer()
-        .text_color(mode === this.mode ? t.foreground : t.dim)
-        .when(mode === this.mode, (el) => el.bg(t.selected))
-        .when(mode !== this.mode, (el) => el.hover((s) => s.text_color(t.muted)))
-        .on_click((_e, cx) => this.setMode(mode, cx))
+    const segment = (id, label, on, click) =>
+      div().id(id).px(9).h(grow(22)).flex().items_center().rounded(6).text_size(TEXT.body).cursor_pointer()
+        .text_color(on ? t.foreground : t.dim)
+        .when(on, (el) => el.bg(t.selected))
+        .when(!on, (el) => el.hover((st) => st.text_color(t.muted)))
+        .on_click(click)
         .child(label);
+    const switcher = (parts) => h_flex().flex_none().p(2).gap(2).rounded(8).bg(t.background + "80").children(parts);
+    const here = placementOf({ overlay: this.own.overlay, pane: this.ownPane()?.pane }, panes(), this.tab);
 
     const key = (cap, label) =>
       h_flex().gap(5).items_center()
-        .child(div().px(5).h(17).flex().items_center().rounded(4).bg(t.hover).text_size(10.5).text_color(t.muted).child(cap))
+        .child(div().px(5).h(grow(17)).flex().items_center().rounded(4).bg(t.hover).text_size(TEXT.label).text_color(t.muted).child(cap))
         .child(div().text_color(t.dim).child(label));
 
     const busy = this.latest.size > 0 || Boolean(this.resuming);
@@ -1183,18 +1245,11 @@ export default class OmniSearch extends View {
       .on_action(MODE_ACTION, (_e, cx) => this.toggleMode(cx))
       .track_focus(this.handle)
       .size_full()
-      .on_size_change((size, cx) => {
-        const { width, height } = unzoomed(size);
-        if (Math.abs(width - this.size.width) > 0.5 || Math.abs(height - this.size.height) > 0.5) {
-          this.size = { width, height };
-          cx.notify();
-        }
-      })
-      .bg(t.popover)
-      .text_size(13)
+      .bg(this.own.overlay ? t.popover : t.background)
+      .text_size(TEXT.base)
       .on_key_down((e, cx) => {
         const k = e.key;
-        if (k === "escape") return this.close();
+        if (k === "escape") return this.leave();
         if (k === "enter" && e.modifiers?.shift) {
           this.moveToApp(this.current(), cx);
           cx.stop_propagation();
@@ -1211,24 +1266,35 @@ export default class OmniSearch extends View {
       })
       .child(
         h_flex()
-          .h(56)
+          .h(grow(56))
           .flex_none()
           .px(18)
           .gap(12)
           .items_center()
-          .child(svg("mods/workspace-chrome/search.svg").size(17).flex_none().text_color(t.dim))
-          .child(Input.new(this.input).flex_1().h_full().text_size(16).text_color(t.foreground))
-          .when(busy, (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(13).flex_none().text_color(t.dim).spin(900)))
-          .child(h_flex().flex_none().p(2).gap(2).rounded(8).bg(t.background + "80").children(MODES.map(segment))),
+          .child(svg("mods/workspace-chrome/search.svg").size(px(17)).flex_none().text_color(t.dim))
+          .child(Input.new(this.input).flex_1().h_full().text_size(TEXT.input).text_color(t.foreground))
+          .when(busy, (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(px(13)).flex_none().text_color(t.dim).spin(900)))
+          .child(switcher(MODES.map(([mode, label]) => segment(`os-mode-${mode}`, label, mode === this.mode, (_e, cx) => this.setMode(mode, cx)))))
+          .child(switcher(PLACEMENTS.map((pl) => segment(`os-place-${pl.key}`, pl.label, pl.key === here, () => this.moveTo(pl.key, true)).tooltip(pl.about)))),
       )
       .child(div().h(1).flex_none().bg(t.border))
-      .child(h_flex().h(listH).flex_none().child(
+      // The body asks for more than any window has and shrinks to what the popup's share, or the pane, leaves it.
+      // Sized from its own measurement instead, it lost a pixel to rounding on each layout and the popup crept shut.
+      .child(h_flex().id("os-body").h(4000).min_h(0).flex_shrink_1().overflow_hidden()
+        .on_size_change((size, cx) => {
+          const { width, height } = unzoomed(size);
+          if (Math.abs(width - this.size.width) > 0.5 || Math.abs(height - this.size.height) > 0.5) {
+            this.size = { width, height };
+            cx.notify();
+          }
+        })
+        .child(
         list.length
           ? div()
               .id("os-rows")
               .relative()
               .h(listH)
-              .w(Math.max(420, Math.round(this.size.width * 0.4)))
+              .w(listW)
               .flex_none()
               .overflow_hidden()
               .on_scroll_wheel((e, cx) => {
@@ -1236,23 +1302,23 @@ export default class OmniSearch extends View {
                 cx.notify();
               })
               .children(placed)
-          : v_flex().h(listH).w(Math.max(420, Math.round(this.size.width * 0.4))).flex_none().items_center().justify_center().px(40)
-              .child(div().text_size(13).text_color(t.dim).text_center().child(this.notice())),
-      ).child(div().w(1).h_full().flex_none().bg(t.border))
-       .child(this.preview(t, current)))
+          : v_flex().h(listH).w(listW).flex_none().items_center().justify_center().px(40)
+              .child(div().text_size(TEXT.base).text_color(t.dim).text_center().child(this.notice())),
+        )
+        .when(split, (el) => el.child(div().w(1).h_full().flex_none().bg(t.border)).child(this.preview(t, current))))
       .child(div().h(1).flex_none().bg(t.border))
       .child(
         h_flex()
-          .h(34)
+          .h(grow(34))
           .flex_none()
           .px(16)
           .gap(14)
           .items_center()
-          .text_size(11)
+          .text_size(TEXT.small)
           .child(key("↵", "Open"))
           .when(Boolean(this.movable(current)), (el) => el.child(key("⇧↵", "Move to app")))
           .child(key("⇥", this.mode === "live" ? "Sessions" : "Live"))
-          .child(key("esc", "Close"))
+          .when(Boolean(this.own.overlay), (el) => el.child(key("esc", "Close")))
           .child(div().flex_1())
           .child(div().max_w(380).truncate().text_color(this.problems() ? t.blocked : t.dim).child(this.problems() || counted)),
       );

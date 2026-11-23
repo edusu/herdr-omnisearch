@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Fix the app popup creeping shut on some displays. It sized its body from its
+  own measured height, and at an app zoom other than 100% each layout rounded
+  that down a little, so the bottom edge rose until the popup was a strip.
+- The app mod can move out of the popup: Pane keeps it beside your terminals
+  and Tab gives it a tab of its own, with the same words. There it stays open
+  after Enter and re-reads the terminals every 10 s. Popup moves it back.
+- The app mod has settings (`mod.schema.json`, editable in Better Config): font
+  size, scale, list width, whether to show the preview, and whether it opens
+  on Live or Sessions.
+
 ## 0.17.5 - 2026-11-21
 
 - Fix OmniSearch crashing on open. Each open asked every machine for its

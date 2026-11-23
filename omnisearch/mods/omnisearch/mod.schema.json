@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OmniSearch mod.json",
+  "description": "What Herdr reads from OmniSearch's mod.json, and the settings it takes.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "This file's schema, for editors."
+    },
+    "title": {
+      "type": "string",
+      "description": "The mod's name, as Herdr shows it."
+    },
+    "place": {
+      "enum": [
+        "left",
+        "right",
+        "top",
+        "bottom",
+        "none"
+      ],
+      "description": "Where Herdr first docks the mod."
+    },
+    "overlay": {
+      "type": "object",
+      "description": "How mod.open shows it."
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "font_size": {
+          "title": "Font size",
+          "description": "Size of this mod's main text in px; smaller and larger text keep their proportion to it.",
+          "type": "number",
+          "minimum": 9,
+          "maximum": 24,
+          "multipleOf": 0.5,
+          "x-step": 0.5,
+          "x-unit": "px",
+          "default": 13
+        },
+        "scale": {
+          "title": "Scale",
+          "description": "Scales this mod's icons, buttons and row heights. 1 is Herdr's own size.",
+          "type": "number",
+          "minimum": 0.8,
+          "maximum": 1.6,
+          "multipleOf": 0.05,
+          "x-step": 0.05,
+          "default": 1
+        },
+        "list_width": {
+          "title": "List width",
+          "description": "The share of the width the list of results takes; the preview gets the rest. The list is never narrower than 420px.",
+          "type": "number",
+          "minimum": 0.25,
+          "maximum": 0.6,
+          "multipleOf": 0.05,
+          "x-step": 0.05,
+          "default": 0.4
+        },
+        "preview": {
+          "title": "Preview",
+          "description": "Show the selected row's conversation or screen beside the list. It is always hidden where there is no room for it, as in a narrow pane.",
+          "type": "boolean",
+          "default": true
+        },
+        "mode": {
+          "title": "Opens on",
+          "description": "What OmniSearch lists when it opens: live terminals or old agent sessions. Tab switches while it is open.",
+          "type": "string",
+          "enum": [
+            "live",
+            "sessions"
+          ],
+          "x-labels": {
+            "live": "Live",
+            "sessions": "Sessions"
+          },
+          "default": "live"
+        }
+      }
+    }
+  }
+}

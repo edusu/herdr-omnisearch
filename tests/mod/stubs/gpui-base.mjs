@@ -11,6 +11,7 @@ export const InputState = {
       text: "",
       on: (event, fn) => (handlers[event] = fn),
       value: () => state.text,
+      set_value: (text) => (state.text = text),
       focus: () => {},
       fire: (event, cx) => handlers[event]?.({}, cx),
     };

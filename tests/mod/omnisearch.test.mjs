@@ -638,7 +638,7 @@ test("the wheel scrolls the list by the pixels it reports, and later renders lea
   const many = Array.from({ length: 40 }, (_, i) => AGENT(`t${i + 1}`, "idle", 0));
   const state = app({ answers: agentsAt(many) });
   const { view, c } = await open(state);
-  view.render().find("omnisearch").handler("on_size_change")({ width: 1400, height: 800 }, c);
+  view.render().find("os-body").handler("on_size_change")({ width: 1400, height: 800 }, c);
   assert.match(view.render().text(), /Recent 4/);
   view.render().find("os-rows").handler("on_scroll_wheel")({ delta: { x: 0, y: -600 } }, c);
   assert.ok(!view.render().text().includes("Recent 4"), "the top scrolled out of view");
@@ -649,24 +649,25 @@ test("moving the selection still brings the list to it", async () => {
   const many = Array.from({ length: 40 }, (_, i) => AGENT(`t${i + 1}`, "idle", 0));
   const state = app({ answers: agentsAt(many) });
   const { view, c } = await open(state);
-  view.render().find("omnisearch").handler("on_size_change")({ width: 1400, height: 800 }, c);
+  view.render().find("os-body").handler("on_size_change")({ width: 1400, height: 800 }, c);
   view.render().find("os-rows").handler("on_scroll_wheel")({ delta: { x: 0, y: -600 } }, c);
   key(view, c, "up");
   assert.match(view.render().text(), /Recent 4/);
 });
 
-function heights(root) {
-  return root.kids.filter((k) => typeof k !== "string").reduce((sum, k) => sum + (k.calls.find(([n]) => n === "h")?.[1][0] ?? 0), 0);
-}
-
-test("at any app zoom the popup fills its share of the window and its footer stays in view", async () => {
-  for (const zoom of [1, 1.25, 0.9]) {
+test("the body asks for a fixed height and never for the one it measured, so the popup cannot creep shut", async () => {
+  for (const zoom of [1, 1.1, 0.9]) {
     const state = app({ answers: agentsAt([AGENT("t1", "idle", 1)]) });
     state.settings = { zoom };
     const { view, c } = await open(state);
-    assert.ok(heights(view.render()) * zoom > 2000, "it first asks for more than the window has");
-    view.render().find("omnisearch").handler("on_size_change")({ width: 1588, height: 951 }, c);
-    assert.ok(Math.abs(heights(view.render()) * zoom - 951) < 1, `at zoom ${zoom} its parts add up to the 951px it got`);
+    const asked = () => view.render().find("os-body").calls.filter(([n]) => n === "h" || n === "flex_shrink_1").map(([n, a]) => [n, ...a]);
+    assert.deepEqual(asked(), [["h", 4000], ["flex_shrink_1"]]);
+    for (const height of [859, 858, 857]) {
+      view.render().find("os-body").handler("on_size_change")({ width: 1588, height }, c);
+      assert.deepEqual(asked(), [["h", 4000], ["flex_shrink_1"]], `at zoom ${zoom} a measured ${height}px changes nothing it asks for`);
+      const rows = view.render().find("os-rows").calls.find(([n]) => n === "h")[1][0];
+      assert.ok(Math.abs(rows * zoom - height) < 1, "the list is as tall as the body was measured");
+    }
   }
 });
 
@@ -794,4 +795,47 @@ test("a machine whose agent list never answers is asked once, however often the 
     view.close();
   }
   assert.equal(asked, 1, "a wait that never ends is shared, not started again on each open");
+});
+
+test("mod.json settings set the text size, hide the preview and pick the list it opens on", async () => {
+  const state = app({ answers: { here: ok([TERMINAL]) } });
+  state.modJson = JSON.stringify({ settings: { font_size: 19.5, preview: false, mode: "sessions" } });
+  const { view, c } = await open(state);
+  const root = view.render();
+  assert.deepEqual(root.calls.find(([n]) => n === "text_size")[1], [19.5]);
+  assert.ok(!root.text().includes("in the app"), "no preview beside the list");
+  assert.ok(state.calls.some((call) => call.args.includes("--archive")), "it searched old sessions");
+  // The sizes are the module's: the next open, with no settings, is back at the defaults.
+  const again = await open(app({ answers: { here: ok([TERMINAL]) } }));
+  assert.deepEqual(again.view.render().calls.find(([n]) => n === "text_size")[1], [13]);
+  assert.ok(again.view.render().text().includes("in the app"));
+});
+
+test("Pane moves the popup beside the terminals with the same words, and closes the popup", async () => {
+  const state = app({ answers: { here: ok([TERMINAL]) } });
+  state.focused = { pane: "p1", tab: "tb1", terminal: "t1" };
+  const { view, c } = await open(state);
+  await type(view, c, "login");
+  view.render().find("os-place-pane").handler("on_click")({}, c);
+  assert.deepEqual(state.ran, [["pane.split", { direction: "right", mod: "omnisearch", props: { query: "login", mode: "live", tab: "tb1" } }]]);
+  assert.deepEqual(state.closed, ["o1"]);
+});
+
+test("in a pane it starts from the words it was given, stays open after Enter and Esc, reads again, and moves back to a popup", async () => {
+  const state = app({ answers: { here: ok([TERMINAL]) }, panes: [{ pane: "p1", tab: "tb1", terminal: "t3" }, { pane: "p9", tab: "tb1", mod: "omnisearch", focused: true }] });
+  state.props = { query: "login", mode: "live", tab: "tb1" };
+  state.focused = { pane: "p9", tab: "tb1", terminal: null };
+  const { view, c } = await open(state);
+  assert.ok(state.calls.some((call) => call.args.join(" ").endsWith("-- login")), "it searched the words it was given");
+  await enter(c);
+  key(view, c, "escape");
+  assert.deepEqual(state.ran, [["tab.select", { id: "tb1" }], ["pane.focus", { terminal: "t3" }]]);
+  assert.deepEqual(state.closed, []);
+  const refreshes = () => state.calls.filter((call) => call.args.includes("--refresh")).length;
+  const before = refreshes();
+  await tick(c);
+  assert.equal(refreshes(), before + 1);
+  view.render().find("os-place-popup").handler("on_click")({}, c);
+  assert.deepEqual(state.opened, [{ mod: "omnisearch", kind: "popup", at: "top", offset: 28, width: 0.92, height: 0.88, props: { query: "login", mode: "live", tab: "tb1" } }]);
+  assert.deepEqual(state.ran.at(-1), ["pane.close", { pane: "p9" }]);
 });

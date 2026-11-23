@@ -521,7 +521,7 @@ Run the tests with:
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
-node --import ./tests/mod/loader.mjs --test tests/mod/omnisearch.test.mjs
+node --import ./tests/mod/loader.mjs --test tests/mod/omnisearch.test.mjs tests/mod/units.test.mjs
 ```
 
 The suite redirects plugin state to a temporary directory on its own.
